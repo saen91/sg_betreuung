@@ -18,6 +18,7 @@ $plugins->add_hook("forumdisplay_threadlist", "sg_betreuung_showforen");
 $plugins->add_hook("misc_start", "sg_betreuung_misc"); //was passiert, wenn Button gedrückt wird
 $plugins->add_hook('showthread_start', 'sg_betreuung_showthread'); //anzeige im Thema
 $plugins->add_hook("modcp_start", "sg_betreuung_modcp"); //Für die Anzeige von allen Themen übers MODCP 
+$plugins->add_hook("datahandler_post_insert_post_end", "sg_betreuung_alert_newreply"); //der Hook, damit die Alerts bei neuen Antworten gehen
 
 //Das hässliche MyAlerts-Hook Zeug hinzufügen
 if(class_exists('MybbStuff_MyAlerts_AlertTypeManager')) {
@@ -415,12 +416,13 @@ function sg_betreuung_deactivate()
 //Helper alle betreuernamen aus dem Thema holen
 function sg_betreuung_get_usernames_by_tid($tid)
 {
-    global $db;
+    global $db, $mybb;
 
     $looked_usernames = array();
+    $looked_groups = array_map('trim', explode(',', $mybb->settings['sg_betreuung_groups']));
 
     $q_names = $db->write_query("
-        SELECT u.uid, u.username, u.usergroup, u.displaygroup
+        SELECT u.uid, u.username, u.usergroup, u.displaygroup, u.additionalgroups
         FROM " . TABLE_PREFIX . "sg_betreuung b
         LEFT JOIN " . TABLE_PREFIX . "users u ON (u.uid = b.uid)
         WHERE b.tid = '{$tid}'
@@ -428,17 +430,42 @@ function sg_betreuung_get_usernames_by_tid($tid)
     ");
 
     while ($row = $db->fetch_array($q_names)) {
-        if (!empty($row['username'])) {
 
-            // Benutzer formatieren (Farbe + Stil aus Gruppen)
-            $formatted_name = format_name(htmlspecialchars_uni($row['username']),$row['usergroup'],$row['displaygroup']);
+        $is_allowed = false;
 
-            // Profil-Link bauen
-            $profile_link = get_profile_link($row['uid']);
-
-            // Klickbaren Link erstellen
-            $looked_usernames[] = "<a href=\"{$profile_link}\">{$formatted_name}</a>";
+        //Die Gruppenabfragen
+        if (in_array($row['usergroup'], $looked_groups)) {
+            $is_allowed = true;
         }
+
+        if (!$is_allowed && in_array($row['displaygroup'], $looked_groups)) {
+            $is_allowed = true;
+        }
+
+        if (!$is_allowed && !empty($row['additionalgroups'])) {
+            $additional = array_map('trim', explode(',', $row['additionalgroups']));
+            foreach ($additional as $gid) {
+                if (in_array($gid, $looked_groups)) {
+                    $is_allowed = true;
+                    break;
+                }
+            }
+        }
+
+        //Wenn User nicht darf, dann überspringen
+        if (!$is_allowed) {
+            continue;
+        }
+
+        $formatted_name = format_name(
+            htmlspecialchars_uni($row['username']),
+            $row['usergroup'],
+            $row['displaygroup']
+        );
+
+        $profile_link = get_profile_link($row['uid']);
+
+        $looked_usernames[] = "<a href=\"{$profile_link}\">{$formatted_name}</a>";
     }
 
     return $looked_usernames;
@@ -480,6 +507,15 @@ function sg_betreuung_showforen()
     //Themen und Foren ID
     $fid = $thread['fid'];
     $tid = $thread['tid'];
+
+    //last seen aktualisieren, damit der Pfeil kommt
+    if ($mybb->user['uid'] > 0 && sg_betreuung_user_looks_after($tid, $mybb->user['uid'])) {
+        $db->update_query(
+            "sg_betreuung",
+            array("last_seen" => $thread['lastpost']),
+            "tid = '{$tid}' AND uid = '{$mybb->user['uid']}'"
+        );
+    }
 
     //Wenn nicht anzeigeforum, dann nichts ausgeben.
     if ($anzeigeforum != -1) {
@@ -768,7 +804,7 @@ function sg_betreuung_showthread()
 //Die Ausgabe von der Übersicht, wer was betreut. 
 function sg_betreuung_modcp() {
 
-    global $db, $mybb, $thread,$theme, $header, $headerinclude, $footer, $page, $templates;
+    global $db, $mybb, $thread,$theme, $header, $headerinclude, $footer, $page, $templates, $newpost_icon;
 
     if ($mybb->get_input('action') != 'sg_betreuung') {
         return;
@@ -823,6 +859,12 @@ function sg_betreuung_modcp() {
 
         //Datum des letzten Beitrags
         $lastpost = my_date('relative', $ownt['thread_lastpost']);
+
+        //damit der Pfeil kommt bei neuste Beiträge:
+        $newpost_icon = "";
+        if ($ownt['thread_lastpost'] > $ownt['last_seen']) {
+            $newpost_icon = '<i class="far fa-folder-open" title="Neue Beiträge" style="font-size:14px;"></i> ';
+        }
 
         eval("\$ownthreads_bit .= \"" . $templates->get("betreuung_threads_own") . "\";"); 
 
@@ -944,60 +986,162 @@ function sg_betreuung_modcp() {
     
 }
 
+//Das hier ist die Funktion für Antworten und den shit
+function sg_betreuung_alert_newreply(&$datahandler)
+{
+    global $db, $mybb, $cache;
+
+    if (!class_exists('MybbStuff_MyAlerts_AlertManager')) {
+        return;
+    }
+
+    $tid = $datahandler->data['tid'];
+    $pid = $datahandler->return_values['pid'];
+    $poster_uid = $datahandler->data['uid'];
+
+    if (empty($tid) || empty($pid)) {
+        return;
+    }
+
+    $thread = $db->fetch_array(
+        $db->simple_select("threads", "tid, subject, lastpost", "tid = '{$tid}'")
+    );
+
+    if (empty($thread['tid'])) {
+        return;
+    }
+
+    //Hier ist der Alert kram
+    $alertTypeManager = MybbStuff_MyAlerts_AlertTypeManager::getInstance();
+
+        if (!$alertTypeManager) {
+            $alertTypeManager = MybbStuff_MyAlerts_AlertTypeManager::createInstance($db, $cache);
+        }
+
+        $alertType = $alertTypeManager->getByCode('sg_betreuung_alert_newreply');
+
+        if (!$alertType || !$alertType->getEnabled()) {
+            return;
+        }
+
+        $alertManager = MybbStuff_MyAlerts_AlertManager::getInstance();
+
+        if (!$alertManager) {
+            $alertManager = MybbStuff_MyAlerts_AlertManager::createInstance($db, $cache);
+        }
+
+    //Wer betreut aus der DB holen?
+    $betreuer = $db->simple_select("sg_betreuung", "uid, last_seen", "tid = '{$tid}'");
+
+    while ($row = $db->fetch_array($betreuer)) {
+
+        //nicht den Antwortschreiber selbst benachrichtigen
+        if ($row['uid'] == $poster_uid) {
+            continue;
+        }
+
+        //nur benachrichtigen, wenn seit last_seen wirklich etwas neu ist
+        if ($thread['lastpost'] <= $row['last_seen']) {
+            continue;
+        }
+
+        //nur, wenn eine neue Antwort einen Alert... nicht bei mehr
+        $type_id = $alertType->getId();
+
+        $already_alerted = $db->fetch_field(
+            $db->simple_select(
+                "alerts",
+                "id",
+                "uid = '{$row['uid']}' AND alert_type_id = '{$type_id}' AND object_id = '{$tid}' AND unread = '1'"
+            ),
+            "id"
+        );
+
+        if ($already_alerted) {
+            continue;
+        }
+
+        $alert = new MybbStuff_MyAlerts_Entity_Alert(
+            $row['uid'],
+            $alertType,
+            $tid,
+            $poster_uid
+        );
+
+        $alert->setExtraDetails(array(
+            'tid' => $tid,
+            'pid' => $pid,
+            'subject' => $thread['subject'],
+            'recipient_uid' => $row['uid']
+        ));
+
+        $alertManager->addAlert($alert);
+    }
+}
+
+
+
 //MyAlerts einfügen 
 function sg_betreuung_myalerts() {
     global $mybb, $lang;
 
     //Alert Formatierer für meinen eigenen Alert Typ
     class MybbStuff_MyAlerts_Formatter_sg_betreuung_newpostFormatter extends MybbStuff_MyAlerts_Formatter_AbstractFormatter
-	{
-        /**
-	    * Formatiert einen Alert in eine Ausgabezeichenfolge, die sowohl auf der Hauptseite als auch im Popup verwendet werden soll .
-	    * @param MybbStuff_MyAlerts_Entity_Alert $alert Die Benachrichtigung zum Format.
-	    * @return string Die formatierte Alert-Meldung.
-	    */
-
+    {
         public function formatAlert(MybbStuff_MyAlerts_Entity_Alert $alert, array $outputAlert)
         {
             global $db;
 
             $alertContent = $alert->getExtraDetails();
-            $username = $db->escape_string($alertContent['username']);
-            $userid = $db->fetch_field($db->simple_select("users", "uid", "username = '{$username}'"), "uid");
-            $user = get_user($userid);
-            $alertContent['username'] = format_name($user['username'], $user['usergroup'], $user['displaygroup']);
-	        return $this->lang->sprintf(
-	            $this->lang->sg_betreuung_alert_newreply,
-                $alertContent['username'],
-                $alertContent['from'],
-                $alertContent['tid'],
-                $alertContent['pid'],
-                $alertContent['subject']
-	        );
+
+            $tid = $alertContent['tid'];
+            $recipient_uid = $alertContent['recipient_uid'];
+
+            // wann war der betreuer zuletzt im Thema?
+            $last_seen = $db->fetch_field(
+                $db->simple_select(
+                    "sg_betreuung",
+                    "last_seen",
+                    "tid = '{$tid}' AND uid = '{$recipient_uid}'"
+                ),
+                "last_seen"
+            );
+
+            // Neue Beiträge seit last_seen
+            $count = $db->fetch_field(
+                $db->simple_select(
+                    "posts",
+                    "COUNT(pid) AS count_posts",
+                    "tid = '{$tid}' AND dateline > '{$last_seen}'"
+                ),
+                "count_posts"
+            );
+
+            if ($count > 1) {
+                return $this->lang->sprintf(
+                    $this->lang->sg_betreuung_alert_newreply_multiple,
+                    $count,
+                    htmlspecialchars_uni($alertContent['subject'])
+                );
+            }
+
+            return $this->lang->sprintf(
+                $this->lang->sg_betreuung_alert_newreply_single,
+                htmlspecialchars_uni($alertContent['subject'])
+            );
         }
 
-        /**
-	    * Intilaisierungsfunktion wird vor dem Ausführen von formatAlert() aufgerufen. Dient zum Laden von Langdateien und zur Initialisierung anderer Ressourcen
-	    * @return void
-	    */
-
         public function init()
-	    {
-	        $this->lang->load('sg_betreuung');
-	    }
-
-         /**
-	    * Erstellt einen Link zum Inhalt eines Alerts, damit das System dorthin weiterleiten kann
-	    * @param MybbStuff_MyAlerts_Entity_Alert $alert Der Alert zum Erstellen des Links
-	    * @return string Der erstellte Alert, vorzugsweise ein absoluter Link.
-	    */
+        {
+            $this->lang->load('sg_betreuung');
+        }
 
         public function buildShowLink(MybbStuff_MyAlerts_Entity_Alert $alert)
-	    {
+        {
             $alertContent = $alert->getExtraDetails();
-            return $this->mybb->settings['bburl'] . '/showthread.php?tid='.$alertContent['tid'].'&pid='.$alertContent['pid'].'#pid'.$alertContent['pid'];
-	    }
 
+            return $this->mybb->settings['bburl'] . '/showthread.php?tid=' . $alertContent['tid'] . '&action=newpost';
+        }
     }
 
     //das ist die eigene Klasse für "Nachricht an Themenersteller"
